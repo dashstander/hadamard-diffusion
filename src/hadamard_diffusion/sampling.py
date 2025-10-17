@@ -4,7 +4,7 @@ from torch.distributions import Categorical
 import numpy as np
 from tqdm import tqdm
 
-from .score_model import BinaryUniformGraph
+from .boolean_cube import BinaryUniformGraph
 
 
 def sample_categorical(probs, method="hard"):

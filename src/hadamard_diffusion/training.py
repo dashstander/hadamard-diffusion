@@ -10,7 +10,8 @@ from tqdm import tqdm
 import wandb
 
 from hadamard_diffusion.losses import score_entropy_loss_fn, t_dce_loss_fn, lambda_dce_loss_fn
-from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel, BinaryUniformGraph
+from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel
+from hadamard_diffusion.boolean_cube import BinaryUniformGraph, BinaryAbsorbingGraph
 from hadamard_diffusion.sampling import get_binary_sampler, validate_hadamard_properties
 
 
@@ -270,6 +271,7 @@ def train_hadamard_diffusion(
     eval_batch_size=8,
     model_type='score',  # 'score' or 'radd'
     loss_type=None,  # Auto-select based on model_type if None
+    graph_type='uniform',  # 'uniform' or 'absorbing'
     use_wandb=True,
     wandb_project="hadamard-diffusion",
     wandb_run_name=None
@@ -292,6 +294,7 @@ def train_hadamard_diffusion(
         eval_batch_size: Batch size for evaluation
         model_type: 'score' (time-dependent) or 'radd' (time-independent)
         loss_type: 'score_entropy', 't_dce', or 'lambda_dce' (auto-selected if None)
+        graph_type: 'uniform' (uniform diffusion) or 'absorbing' (absorbing diffusion)
         use_wandb: Whether to use Weights & Biases logging
         wandb_project: W&B project name
         wandb_run_name: W&B run name (auto-generated if None)
@@ -331,7 +334,13 @@ def train_hadamard_diffusion(
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    graph = BinaryUniformGraph()
+    # Initialize graph
+    if graph_type == 'uniform':
+        graph = BinaryUniformGraph()
+    elif graph_type == 'absorbing':
+        graph = BinaryAbsorbingGraph()
+    else:
+        raise ValueError(f"Unknown graph type: {graph_type}")
 
     # Initialize optimizer and loss
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -350,6 +359,7 @@ def train_hadamard_diffusion(
         config = {
             'model_type': model_type,
             'loss_type': loss_type or default_loss_type,
+            'graph_type': graph_type,
             'matrix_size': matrix_size,
             'num_epochs': num_epochs,
             'batch_size': batch_size,

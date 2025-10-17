@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from torch.nn import Module, Linear, Embedding, Parameter, LayerNorm
 from torch.nn.functional import gelu, pad, softmax, scaled_dot_product_attention, silu
 import math
@@ -357,3 +358,80 @@ class HadamardTransformerLayer(Module):
         return element_reps, row_reps, column_reps
 
 
+
+class HadamardRADDLayer(nn.Module):
+    """Time-independent Hadamard Transformer layer"""
+
+    def __init__(self, element_dim, pool_dim, num_heads, head_dim, ffn_hidden_dim):
+        super().__init__()
+        self.element_dim = element_dim
+        self.pool_dim = pool_dim
+
+        # Shared attention modules (for weight sharing between row/column)
+        self.element_attention = MatrixElementAttention(element_dim, num_heads, head_dim)
+        self.pool_attention = MatrixColumnAttention(pool_dim, num_heads, head_dim)
+
+        # Pooling modules
+        self.column_pooling = AttentionPooling(element_dim, pool_dim)
+        self.row_pooling = AttentionPooling(element_dim, pool_dim)
+
+        # Cross attention modules (shared weights)
+        self.cross_attention = CrossAttention(element_dim, pool_dim, num_heads, head_dim)
+
+        # Simple RMS normalization layers (no time conditioning)
+        self.element_norm1 = RMSNorm(element_dim)
+        self.element_norm2 = RMSNorm(element_dim)
+        self.element_norm3 = RMSNorm(element_dim)
+        self.pool_norm1 = RMSNorm(pool_dim)
+        self.pool_norm2 = RMSNorm(pool_dim)
+
+        # Feed-forward layers
+        self.element_ffn = GeGLU(element_dim, ffn_hidden_dim)
+        self.column_ffn = GeGLU(pool_dim, ffn_hidden_dim)
+        self.row_ffn = GeGLU(pool_dim, ffn_hidden_dim)
+
+    def forward(self, element_reps, row_reps=None, column_reps=None):
+        """
+        Args:
+            element_reps: (batch, x_dim, y_dim, element_dim)
+            row_reps: (batch, y_dim, pool_dim) or None
+            column_reps: (batch, x_dim, pool_dim) or None
+
+        Returns:
+            tuple: (element_reps, row_reps, column_reps)
+        """
+        # 1. Element attention on rows (transpose to get row attention)
+        element_reps = element_reps + self.element_attention(
+            self.element_norm1(element_reps).permute(0, 2, 1, 3)
+        ).permute(0, 2, 1, 3)
+
+        # 2. Element attention on columns
+        element_reps = element_reps + self.element_attention(
+            self.element_norm2(element_reps)
+        )
+
+        # 3. Pool to column and row representations
+        if column_reps is None:
+            column_reps = self.column_pooling(element_reps)
+        if row_reps is None:
+            # For row pooling: transpose to (batch, y_dim, x_dim, element_dim),
+            # pool over x_dim to get (batch, y_dim, pool_dim)
+            row_reps = self.row_pooling(element_reps.permute(0, 2, 1, 3))
+
+        # 4. Column attention
+        column_reps = column_reps + self.pool_attention(self.pool_norm1(column_reps))
+
+        # 5. Row attention (reuse same weights)
+        row_reps = row_reps + self.pool_attention(self.pool_norm2(row_reps))
+
+        # 6. Cross attention: column_reps -> elements + row_reps -> elements
+        cross_from_columns = self.cross_attention(element_reps, column_reps)
+        cross_from_rows = self.cross_attention(element_reps, row_reps)
+        element_reps = element_reps + cross_from_columns + cross_from_rows
+
+        # 7. Feed-forward on all three representations (no time conditioning)
+        element_reps = element_reps + self.element_ffn(self.element_norm3(element_reps))
+        column_reps = column_reps + self.column_ffn(column_reps)
+        row_reps = row_reps + self.row_ffn(row_reps)
+
+        return element_reps, row_reps, column_reps

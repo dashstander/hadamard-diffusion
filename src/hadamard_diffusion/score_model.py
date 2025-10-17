@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 from torch.nn.functional import log_softmax, softmax
 
-from .layers import HadamardTransformerLayer, MatrixEmbedding, RMSNorm, AttentionPooling, CrossAttention, MatrixElementAttention, MatrixColumnAttention, GeGLU
+from hadamard_diffusion.layers import (
+    HadamardTransformerLayer,
+    MatrixEmbedding,
+    RMSNorm,
+    HadamardRADDLayer
+)
 
 
 class HadamardScoreModel(nn.Module):
@@ -167,189 +172,15 @@ class HadamardRADDModel(nn.Module):
         Returns:
             probs: (batch, height, width, num_classes) conditional probabilities
         """
-        # Convert to embeddings
-        embedded = self.embedding(x)
-
-        # Process through transformer layers
-        element_reps = embedded
-        row_reps = None
-        column_reps = None
-
-        for layer in self.layers:
-            element_reps, row_reps, column_reps = layer(element_reps, row_reps, column_reps)
-
-        # Final normalization
-        element_reps = self.final_norm(element_reps)
-
-        # Project to conditional probability logits
-        logits = self.prob_proj(element_reps)
-
-        # Convert to probabilities using softmax
-        probs = softmax(logits, dim=-1)
-
-        return probs
+        return softmax(self.forward(x), dim=-1)
 
 
-class HadamardRADDLayer(nn.Module):
-    """Time-independent Hadamard Transformer layer"""
-
-    def __init__(self, element_dim, pool_dim, num_heads, head_dim, ffn_hidden_dim):
-        super().__init__()
-        self.element_dim = element_dim
-        self.pool_dim = pool_dim
-
-        # Shared attention modules (for weight sharing between row/column)
-        self.element_attention = MatrixElementAttention(element_dim, num_heads, head_dim)
-        self.pool_attention = MatrixColumnAttention(pool_dim, num_heads, head_dim)
-
-        # Pooling modules
-        self.column_pooling = AttentionPooling(element_dim, pool_dim)
-        self.row_pooling = AttentionPooling(element_dim, pool_dim)
-
-        # Cross attention modules (shared weights)
-        self.cross_attention = CrossAttention(element_dim, pool_dim, num_heads, head_dim)
-
-        # Simple RMS normalization layers (no time conditioning)
-        self.element_norm1 = RMSNorm(element_dim)
-        self.element_norm2 = RMSNorm(element_dim)
-        self.element_norm3 = RMSNorm(element_dim)
-        self.pool_norm1 = RMSNorm(pool_dim)
-        self.pool_norm2 = RMSNorm(pool_dim)
-
-        # Feed-forward layers
-        self.element_ffn = GeGLU(element_dim, ffn_hidden_dim)
-        self.column_ffn = GeGLU(pool_dim, ffn_hidden_dim)
-        self.row_ffn = GeGLU(pool_dim, ffn_hidden_dim)
-
-    def forward(self, element_reps, row_reps=None, column_reps=None):
-        """
-        Args:
-            element_reps: (batch, x_dim, y_dim, element_dim)
-            row_reps: (batch, y_dim, pool_dim) or None
-            column_reps: (batch, x_dim, pool_dim) or None
-
-        Returns:
-            tuple: (element_reps, row_reps, column_reps)
-        """
-        # 1. Element attention on rows (transpose to get row attention)
-        element_reps = element_reps + self.element_attention(
-            self.element_norm1(element_reps).permute(0, 2, 1, 3)
-        ).permute(0, 2, 1, 3)
-
-        # 2. Element attention on columns
-        element_reps = element_reps + self.element_attention(
-            self.element_norm2(element_reps)
-        )
-
-        # 3. Pool to column and row representations
-        if column_reps is None:
-            column_reps = self.column_pooling(element_reps)
-        if row_reps is None:
-            # For row pooling: transpose to (batch, y_dim, x_dim, element_dim),
-            # pool over x_dim to get (batch, y_dim, pool_dim)
-            row_reps = self.row_pooling(element_reps.permute(0, 2, 1, 3))
-
-        # 4. Column attention
-        column_reps = column_reps + self.pool_attention(self.pool_norm1(column_reps))
-
-        # 5. Row attention (reuse same weights)
-        row_reps = row_reps + self.pool_attention(self.pool_norm2(row_reps))
-
-        # 6. Cross attention: column_reps -> elements + row_reps -> elements
-        cross_from_columns = self.cross_attention(element_reps, column_reps)
-        cross_from_rows = self.cross_attention(element_reps, row_reps)
-        element_reps = element_reps + cross_from_columns + cross_from_rows
-
-        # 7. Feed-forward on all three representations (no time conditioning)
-        element_reps = element_reps + self.element_ffn(self.element_norm3(element_reps))
-        column_reps = column_reps + self.column_ffn(column_reps)
-        row_reps = row_reps + self.row_ffn(row_reps)
-
-        return element_reps, row_reps, column_reps
-
-
-class BinaryUniformGraph:
-    """Simplified uniform graph for binary {-1, +1} states"""
-
-    def __init__(self):
-        self.dim = 2  # Two classes: -1 and +1
-        self.absorb = False
-
-    def value_to_index(self, x):
-        """Convert {-1, +1} values to {0, 1} indices"""
-        return torch.where(x == -1, 0, 1).long()
-
-    def index_to_value(self, indices):
-        """Convert {0, 1} indices to {-1, +1} values"""
-        return torch.where(indices == 0, -1, 1)
-
-    def sample_transition(self, x, sigma):
-        """Sample from the uniform transition for binary case"""
-        # Convert values to indices
-        indices = self.value_to_index(x)
-
-        # Uniform transition: stay with prob exp(-sigma), flip with prob 1-exp(-sigma)
-        move_chance = 1 - torch.exp(-sigma)
-
-        # Ensure move_chance broadcasts correctly with x
-        while move_chance.dim() < x.dim():
-            move_chance = move_chance.unsqueeze(-1)
-
-        should_flip = torch.rand_like(x.float()) < move_chance
-
-        # Flip indices where needed
-        new_indices = torch.where(should_flip, 1 - indices, indices)
-
-        # Convert back to values
-        return self.index_to_value(new_indices)
-
-    def score_entropy(self, log_score, sigma, x, x0):
-        """Score entropy loss for uniform binary diffusion"""
-        # Convert to indices
-        x_indices = self.value_to_index(x)
-        x0_indices = self.value_to_index(x0)
-
-        # Extract scores for current states
-        score = log_score.exp()  # Convert from log-space
-
-        # For uniform graph: score_entropy = exp(score).mean() - score[x] + corrections
-        batch_shape = x.shape[:-1] if x.dim() > 1 else x.shape
-
-        # Positive term: E[exp(score)]
-        pos_term = score.mean(dim=-1)
-
-        # Negative term: score at current position
-        neg_term = torch.gather(score, -1, x_indices.unsqueeze(-1)).squeeze(-1)
-
-        # Constant correction term (simplified for uniform case)
-        # This depends on whether we moved or stayed
-        moved = (x_indices != x0_indices)
-        sigma_flat = sigma.squeeze(-1)
-        esigma_minus_1 = torch.expm1(sigma_flat)
-
-        # Ensure proper broadcasting for batch dimensions
-        while esigma_minus_1.dim() < moved.dim():
-            esigma_minus_1 = esigma_minus_1.unsqueeze(-1)
-        while sigma_flat.dim() < moved.dim():
-            sigma_flat = sigma_flat.unsqueeze(-1)
-
-        # Correction based on transition probabilities
-        const_term = torch.where(
-            moved,
-            -torch.log(esigma_minus_1) / 2,  # If we moved
-            torch.log1p(-torch.exp(-sigma_flat)) / 2  # If we stayed
-        )
-
-        return pos_term - neg_term / 2 + const_term
-
-    def sample_limit(self, *batch_dims):
-        """Sample from limiting distribution (uniform over {-1, +1})"""
-        indices = torch.randint(0, 2, batch_dims)
-        return self.index_to_value(indices)
 
 
 # Test script
 if __name__ == "__main__":
+    from hadamard_diffusion.boolean_cube import BinaryUniformGraph
+
     # Test both models
     batch_size = 2
     matrix_size = 32
