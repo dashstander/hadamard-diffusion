@@ -7,8 +7,32 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
-from .score_model import HadamardScoreModel, BinaryUniformGraph
+from .score_model import HadamardScoreModel, HadamardRADDModel, BinaryUniformGraph
 from .sampling import get_binary_sampler, validate_hadamard_properties
+
+
+def reparameterized_schedule(t, t_critical=0.013, concentration=10.0):
+    """
+    Reparameterize time to concentrate samples around critical temperature
+
+    Args:
+        uniform_t: Uniform time points in [0, 1]
+        t_critical: Critical temperature from phase transition analysis
+        concentration: Higher values = more concentration around t_critical
+    """
+    # Map [0,1] to [-1,1] for logit
+    
+
+    # Apply logit-like transform and scale
+    logit_t = np.log(((1 + t) / (1 - t)) - 1) / concentration
+
+    # Shift to center around t_critical and map back to [0,1]
+    reparameterized_t = logit_t + t_critical
+
+    # Ensure bounds and normalize
+    return np.clip(reparameterized_t, 0, 1)
+
+
 
 
 class HadamardDataset(Dataset):
@@ -46,8 +70,14 @@ class HadamardDataset(Dataset):
         return torch.from_numpy(matrix).float()
 
 
-def get_loss_fn(graph, sampling_eps=1e-3):
-    """Loss function for discrete diffusion training"""
+def get_loss_fn(graph, sampling_eps=1e-3, loss_type='score_entropy'):
+    """Loss function for discrete diffusion training
+
+    Args:
+        graph: BinaryUniformGraph instance
+        sampling_eps: Small epsilon for numerical stability
+        loss_type: 'score_entropy', 't_dce', or 'lambda_dce'
+    """
 
     def loss_fn(model, batch):
         batch_size = batch.shape[0]
@@ -69,7 +99,92 @@ def get_loss_fn(graph, sampling_eps=1e-3):
         # Take mean over spatial dimensions and batch
         return loss.mean()
 
-    return loss_fn
+    def t_dce_loss_fn(model, batch):
+        """t-DCE loss for time-independent models"""
+        batch_size = batch.shape[0]
+        device = batch.device
+
+        # Sample random timesteps
+        t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
+        sigma = t.unsqueeze(-1)
+
+        # Sample noisy version using absorbing diffusion
+        x_noisy = graph.sample_transition(batch, sigma)
+
+        # Get model prediction (conditional probabilities)
+        log_probs = model(x_noisy)  # No time conditioning
+
+        # Convert values to indices for gathering
+        x_indices = graph.value_to_index(batch)
+
+        # Mask for positions that were corrupted (different from clean)
+        corrupted_mask = (x_noisy != batch)
+
+        # Extract log probabilities for clean values at corrupted positions
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1).unsqueeze(-1)
+        height_indices = torch.arange(batch.shape[1], device=device).unsqueeze(0).unsqueeze(-1)
+        width_indices = torch.arange(batch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+
+        # Gather log probabilities for true values
+        neg_log_probs = -torch.gather(
+            log_probs[batch_indices, height_indices, width_indices],
+            -1,
+            x_indices.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Apply mask and compute loss only for corrupted positions
+        loss = torch.where(corrupted_mask, neg_log_probs, torch.zeros_like(neg_log_probs))
+
+        # Weight by noise level and take mean
+        sigma_flat = sigma.squeeze(-1)
+        esigma_minus_1 = torch.expm1(sigma_flat)
+        weighted_loss = loss * esigma_minus_1.unsqueeze(-1).unsqueeze(-1)
+
+        return weighted_loss.sum() / corrupted_mask.sum().clamp(min=1)
+
+    def lambda_dce_loss_fn(model, batch):
+        """λ-DCE loss for time-independent models"""
+        batch_size = batch.shape[0]
+        device = batch.device
+
+        # Sample λ uniformly from [0, 1]
+        lambda_vals = torch.rand(batch_size, device=device)
+
+        # Create corrupted version by flipping each element with probability λ
+        flip_probs = lambda_vals.unsqueeze(-1).unsqueeze(-1)
+        should_flip = torch.rand_like(batch.float()) < flip_probs
+        x_corrupted = torch.where(should_flip, -batch, batch)
+
+        # Get model prediction
+        log_probs = model(x_corrupted)
+
+        # Convert values to indices
+        x_indices = graph.value_to_index(batch)
+
+        # Extract log probabilities for clean values
+        batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1).unsqueeze(-1)
+        height_indices = torch.arange(batch.shape[1], device=device).unsqueeze(0).unsqueeze(-1)
+        width_indices = torch.arange(batch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+
+        log_probs_clean = torch.gather(
+            log_probs[batch_indices, height_indices, width_indices],
+            -1,
+            x_indices.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Compute λ-DCE loss: -E[log p(x|x_corrupted)] / λ
+        loss_per_sample = -log_probs_clean.sum(dim=(-2, -1)) / lambda_vals.clamp(min=sampling_eps)
+
+        return loss_per_sample.mean()
+
+    if loss_type == 'score_entropy':
+        return loss_fn
+    elif loss_type == 't_dce':
+        return t_dce_loss_fn
+    elif loss_type == 'lambda_dce':
+        return lambda_dce_loss_fn
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
 
 
 def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
@@ -248,7 +363,9 @@ def train_hadamard_diffusion(
     save_dir="checkpoints",
     log_interval=100,
     eval_interval=5,
-    eval_batch_size=8
+    eval_batch_size=8,
+    model_type='score',  # 'score' or 'radd'
+    loss_type=None  # Auto-select based on model_type if None
 ):
     """
     Train Hadamard diffusion model
@@ -293,12 +410,20 @@ def train_hadamard_diffusion(
 
     # Initialize model and graph
     model_kwargs = model_kwargs or {}
-    model = HadamardScoreModel(matrix_size=matrix_size, **model_kwargs).to(device)
+    if model_type == 'score':
+        model = HadamardScoreModel(matrix_size=matrix_size, **model_kwargs).to(device)
+        default_loss_type = 'score_entropy'
+    elif model_type == 'radd':
+        model = HadamardRADDModel(matrix_size=matrix_size, **model_kwargs).to(device)
+        default_loss_type = 't_dce'
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
     graph = BinaryUniformGraph()
 
     # Initialize optimizer and loss
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    loss_fn = get_loss_fn(graph)
+    loss_fn = get_loss_fn(graph, loss_type=loss_type or default_loss_type)
     scaler = GradScaler()
     ema = EMA(model)
 
@@ -397,7 +522,9 @@ def train_hadamard_diffusion(
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': epoch_loss / num_batches,
                 'global_step': global_step,
-                'model_kwargs': model_kwargs
+                'model_kwargs': model_kwargs,
+                'model_type': model_type,
+                'loss_type': loss_type or default_loss_type
             }
             torch.save(checkpoint, Path(save_dir) / f"checkpoint_epoch_{epoch+1}.pt")
 
@@ -412,7 +539,9 @@ def train_hadamard_diffusion(
         'scheduler_state_dict': scheduler.state_dict(),
         'loss': epoch_loss / num_batches,
         'global_step': global_step,
-        'model_kwargs': model_kwargs
+        'model_kwargs': model_kwargs,
+        'model_type': model_type,
+        'loss_type': loss_type or default_loss_type
     }
     torch.save(checkpoint, Path(save_dir) / "final_model.pt")
     print(f"Training completed. Final model saved to {save_dir}/final_model.pt")
@@ -427,8 +556,16 @@ def load_model(checkpoint_path, device=None):
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_kwargs = checkpoint.get('model_kwargs', {})
+    model_type = checkpoint.get('model_type', 'score')  # Default to score model
 
-    model = HadamardScoreModel(**model_kwargs).to(device)
+    # Initialize the correct model type
+    if model_type == 'score':
+        model = HadamardScoreModel(**model_kwargs).to(device)
+    elif model_type == 'radd':
+        model = HadamardRADDModel(**model_kwargs).to(device)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
     model.load_state_dict(checkpoint['model_state_dict'])
 
     # Load EMA weights if available
@@ -442,13 +579,59 @@ def load_model(checkpoint_path, device=None):
 
 # Example usage
 if __name__ == "__main__":
-    # Small test run
-    model, ema = train_hadamard_diffusion(
-        data_dir="data/processed",  # Update path as needed
+    # Example 1: Train score model (time-dependent) with score entropy loss
+    print("Training score model...")
+    model_score, ema_score = train_hadamard_diffusion(
+        data_dir="data/processed",
         num_epochs=5,
         batch_size=16,
-        max_matrices=1000,  # Small subset for testing
+        max_matrices=1000,
         matrix_size=32,
+        model_type='score',
+        loss_type='score_entropy',
+        save_dir="checkpoints_score",
+        model_kwargs={
+            'element_dim': 64,
+            'pool_dim': 32,
+            'num_heads': 4,
+            'head_dim': 16,
+            'ffn_hidden_dim': 128,
+            'num_layers': 3
+        }
+    )
+
+    # Example 2: Train RADD model (time-independent) with t-DCE loss
+    print("\nTraining RADD model...")
+    model_radd, ema_radd = train_hadamard_diffusion(
+        data_dir="data/processed",
+        num_epochs=5,
+        batch_size=16,
+        max_matrices=1000,
+        matrix_size=32,
+        model_type='radd',
+        loss_type='t_dce',
+        save_dir="checkpoints_radd",
+        model_kwargs={
+            'element_dim': 64,
+            'pool_dim': 32,
+            'num_heads': 4,
+            'head_dim': 16,
+            'ffn_hidden_dim': 128,
+            'num_layers': 3
+        }
+    )
+
+    # Example 3: Train RADD model with λ-DCE loss
+    print("\nTraining RADD model with λ-DCE loss...")
+    model_radd_lambda, ema_radd_lambda = train_hadamard_diffusion(
+        data_dir="data/processed",
+        num_epochs=5,
+        batch_size=16,
+        max_matrices=1000,
+        matrix_size=32,
+        model_type='radd',
+        loss_type='lambda_dce',
+        save_dir="checkpoints_radd_lambda",
         model_kwargs={
             'element_dim': 64,
             'pool_dim': 32,
