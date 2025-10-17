@@ -92,7 +92,101 @@ def get_loss_fn(graph, sampling_eps=1e-3, loss_type='score_entropy'):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
-def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
+def hadamard_energy(matrices):
+    """Compute Hadamard energy: ||M @ M.T - n*I||_F
+
+    Args:
+        matrices: (batch, n, n) tensor
+
+    Returns:
+        energies: (batch,) tensor of Hadamard energies
+    """
+    # Convert to float for computation
+    matrices = matrices.float()
+    n = matrices.shape[-1]
+    MMT = matrices @ matrices.transpose(-2, -1)
+    identity = torch.eye(n, device=matrices.device, dtype=matrices.dtype) * n
+    energy = torch.norm(MMT - identity, dim=(-2, -1))
+    return energy
+
+
+def track_denoising_hadamard_energy(model, graph, matrix_size, device, steps=50, num_samples=4, eps=1e-5):
+    """Track Hadamard energy during the denoising process
+
+    Args:
+        model: Trained model
+        graph: Graph instance
+        matrix_size: Size of matrices
+        device: Device to run on
+        steps: Number of denoising steps
+        num_samples: Number of samples to track
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        dict with denoising trajectory analysis
+    """
+    model.eval()
+
+    with torch.no_grad():
+        # Start from the limiting distribution (pure noise)
+        x = graph.sample_limit(num_samples, matrix_size, matrix_size).to(device)
+
+        # Create timestep schedule (reverse: 1.0 -> eps)
+        timesteps = torch.linspace(1.0, eps, steps + 1, device=device)
+        dt = (1.0 - eps) / steps
+
+        # Track Hadamard energy and expected clean data at each step
+        trajectory = []
+
+        for i in range(steps + 1):
+            t = timesteps[i]
+
+            # Compute Hadamard energy of current state
+            current_energy = hadamard_energy(x).mean().item()
+
+            # Get expected clean data based on model type
+            try:
+                # RADD model - can compute expected values directly
+                log_probs = model(x)
+                probs = torch.exp(log_probs)
+
+                # Expected clean data (convert probabilities to expected values)
+                expected_clean = torch.zeros_like(x)
+                expected_clean += probs[..., 0] * (-1)  # P(-1) * (-1)
+                expected_clean += probs[..., 1] * 1     # P(+1) * (+1)
+
+                expected_clean_energy = hadamard_energy(expected_clean).mean().item()
+            except (TypeError, RuntimeError):
+                # Score model - would need additional implementation to get expected clean data
+                expected_clean_energy = None
+
+            trajectory.append({
+                'step': i,
+                'timestep': t.item(),
+                'current_hadamard_energy': current_energy,
+                'expected_clean_hadamard_energy': expected_clean_energy
+            })
+
+            # Denoising step (simplified)
+            if i < steps:
+                try:
+                    # Time-independent model (RADD)
+                    log_probs = model(x)
+                    # Convert to binary values using argmax for simplicity
+                    x = graph.index_to_value(torch.argmax(log_probs, dim=-1))
+                except TypeError:
+                    # Time-dependent model - would need proper denoising implementation
+                    # For now, just keep current state
+                    pass
+
+        return {
+            'trajectory': trajectory,
+            'final_hadamard_energy': trajectory[-1]['current_hadamard_energy'],
+            'initial_hadamard_energy': trajectory[0]['current_hadamard_energy']
+        }
+
+
+def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50, return_timestep_info=False):
     """
     Compute ELBO (Evidence Lower BOund) for held-out data
 
@@ -102,9 +196,11 @@ def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
         graph: BinaryUniformGraph instance
         sampling_eps: Small epsilon for numerical stability
         num_samples: Number of timesteps to sample for Monte Carlo estimate
+        return_timestep_info: If True, return detailed timestep analysis
 
     Returns:
-        ELBO estimate (scalar)
+        If return_timestep_info=False: ELBO estimate (scalar)
+        If return_timestep_info=True: dict with ELBO and timestep analysis
     """
     model.eval()
 
@@ -116,6 +212,7 @@ def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
         t = (1 - sampling_eps) * torch.rand(num_samples, device=device) + sampling_eps
 
         elbo_estimates = []
+        timestep_info = []
 
         for i in range(num_samples):
             # Expand timestep to batch
@@ -125,10 +222,38 @@ def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
             x_noisy = graph.sample_transition(x_clean, t_batch)
 
             # Get model scores
-            log_scores = model(x_noisy, t_batch)
+            try:
+                # Try time-independent first (RADD model)
+                log_scores = model(x_noisy)
+            except TypeError:
+                # Time-dependent model (score model) needs timestep
+                log_scores = model(x_noisy, t_batch)
 
             # Compute score entropy (the integrand of L_DWDSE)
-            score_entropy = graph.score_entropy(log_scores, t_batch, x_noisy, x_clean)
+            if hasattr(graph, 'score_entropy'):
+                score_entropy = graph.score_entropy(log_scores, t_batch, x_noisy, x_clean)
+            else:
+                # For RADD models, compute negative log likelihood
+                x_indices = graph.value_to_index(x_clean)
+                batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1).unsqueeze(-1)
+                height_indices = torch.arange(x_clean.shape[1], device=device).unsqueeze(0).unsqueeze(-1)
+                width_indices = torch.arange(x_clean.shape[2], device=device).unsqueeze(0).unsqueeze(0)
+
+                score_entropy = -torch.gather(
+                    log_scores[batch_indices, height_indices, width_indices],
+                    -1,
+                    x_indices.unsqueeze(-1)
+                ).squeeze(-1).sum(dim=(-2, -1))
+
+            # Store timestep information if requested
+            if return_timestep_info:
+                timestep_info.append({
+                    't': t[i].item(),
+                    'score_entropy_mean': score_entropy.mean().item(),
+                    'score_entropy_std': score_entropy.std().item(),
+                    'hadamard_energy_clean': hadamard_energy(x_clean).mean().item(),
+                    'hadamard_energy_noisy': hadamard_energy(x_noisy).mean().item()
+                })
 
             # Add to estimates
             elbo_estimates.append(score_entropy.mean())
@@ -140,10 +265,19 @@ def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50):
         # For uniform base distribution, this is approximately 0
         kl_divergence = 0.0
 
-        return elbo_estimate.item() + kl_divergence
+        total_elbo = elbo_estimate.item() + kl_divergence
+
+        if return_timestep_info:
+            return {
+                'elbo': total_elbo,
+                'timestep_analysis': timestep_info
+            }
+        else:
+            return total_elbo
 
 
-def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_samples=4):
+def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_samples=4,
+                   include_random_comparison=True, detailed_analysis=True):
     """
     Comprehensive evaluation: ELBO + sampling + Hadamard validation
 
@@ -161,18 +295,25 @@ def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_sam
     model.eval()
 
     # 1. Compute ELBO on held-out data (valid Hadamard matrices)
-    elbo_hadamard = compute_elbo(model, eval_data, graph)
+    if detailed_analysis:
+        elbo_result = compute_elbo(model, eval_data, graph, return_timestep_info=True)
+        elbo_hadamard = elbo_result['elbo']
+        timestep_analysis = elbo_result['timestep_analysis']
+    else:
+        elbo_hadamard = compute_elbo(model, eval_data, graph)
+        timestep_analysis = None
 
-    # 2. Generate random non-Hadamard matrices for comparison
-    # Create random binary matrices that are unlikely to be Hadamard
-    batch_size = eval_data.shape[0]
-    random_matrices = graph.sample_limit(batch_size, matrix_size, matrix_size).to(device)
+    # 2. Optional: Generate random matrices for comparison
+    elbo_random = None
+    if include_random_comparison:
+        batch_size = eval_data.shape[0]
+        random_matrices = graph.sample_data_like(batch_size, matrix_size, matrix_size).to(device)
 
-    # Make them more "random" by flipping some elements to break any accidental structure
-    flip_mask = torch.rand_like(random_matrices.float()) < 0.3  # Flip 30% of elements
-    random_matrices = torch.where(flip_mask, -random_matrices, random_matrices)
+        # Make them more "random" by flipping some elements to break any accidental structure
+        flip_mask = torch.rand_like(random_matrices.float()) < 0.3  # Flip 30% of elements
+        random_matrices = torch.where(flip_mask, -random_matrices, random_matrices)
 
-    elbo_random = compute_elbo(model, random_matrices, graph)
+        elbo_random = compute_elbo(model, random_matrices, graph)
 
     # 3. Generate samples and validate Hadamard properties
     sampler = get_binary_sampler(
@@ -192,34 +333,59 @@ def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_sam
     # Validate Hadamard properties
     validation_results = validate_hadamard_properties(generated_samples, tolerance=1.0)
 
-    # 4. Compute additional metrics
+    # 4. Track denoising Hadamard energy evolution
+    denoising_analysis = None
+    if detailed_analysis:
+        denoising_analysis = track_denoising_hadamard_energy(
+            model, graph, matrix_size, device, steps=20, num_samples=2
+        )
+
+    # 5. Compute additional metrics
 
     # Check value distribution (should be close to {-1, +1})
     unique_vals = torch.unique(generated_samples)
     value_range = (generated_samples.min().item(), generated_samples.max().item())
 
-    # Orthogonality errors for analysis
+    # Orthogonality errors and Hadamard energies for analysis
     orthogonal_errors = []
+    hadamard_energies = []
     for i in range(num_eval_samples):
         H = generated_samples[i]
         HHT = H @ H.T
         expected = matrix_size * torch.eye(matrix_size, device=H.device)
         error = torch.norm(HHT - expected).item()
         orthogonal_errors.append(error)
+        hadamard_energies.append(hadamard_energy(H.unsqueeze(0)).item())
 
-    return {
+    # Build result dictionary
+    result = {
         'elbo_hadamard': elbo_hadamard,
-        'elbo_random': elbo_random,
-        'elbo_difference': elbo_hadamard - elbo_random,  # Should be positive if model learns
         'binary_rate': validation_results['binary_rate'],  # Always 100% due to discrete sampling
         'orthogonal_rate': validation_results['orthogonal_rate'],
         'valid_hadamard_rate': validation_results['valid_rate'],
         'mean_orthogonal_error': np.mean(orthogonal_errors),
         'std_orthogonal_error': np.std(orthogonal_errors),
+        'mean_hadamard_energy': np.mean(hadamard_energies),
+        'std_hadamard_energy': np.std(hadamard_energies),
         'value_range': value_range,
         'unique_values': unique_vals.cpu().tolist(),
         'num_unique_values': len(unique_vals)
     }
+
+    # Add optional metrics
+    if include_random_comparison and elbo_random is not None:
+        result.update({
+            'elbo_random': elbo_random,
+            'elbo_difference': elbo_hadamard - elbo_random
+        })
+
+    if detailed_analysis:
+        result.update({
+            'timestep_analysis': timestep_analysis,
+            'denoising_analysis': denoising_analysis
+        })
+
+    return result
 
 
 class EMA:
@@ -446,32 +612,59 @@ def train_hadamard_diffusion(
                     graph=graph,
                     device=device,
                     matrix_size=matrix_size,
-                    num_eval_samples=4
+                    num_eval_samples=4,
+                    include_random_comparison=True,  # Keep for now as sanity check
+                    detailed_analysis=(epoch + 1) % (eval_interval * 2) == 0  # Detailed analysis every other eval
                 )
 
                 print(f"Evaluation Results:")
                 print(f"  ELBO (Hadamard): {eval_metrics['elbo_hadamard']:.4f}")
-                print(f"  ELBO (Random): {eval_metrics['elbo_random']:.4f}")
-                print(f"  ELBO Difference: {eval_metrics['elbo_difference']:.4f} (should be positive)")
+
+                # Print random comparison if available
+                if 'elbo_random' in eval_metrics:
+                    print(f"  ELBO (Random): {eval_metrics['elbo_random']:.4f}")
+                    print(f"  ELBO Difference: {eval_metrics['elbo_difference']:.4f} (should be positive)")
+
                 print(f"  Orthogonal rate: {eval_metrics['orthogonal_rate']:.2%}")
                 print(f"  Mean orthogonal error: {eval_metrics['mean_orthogonal_error']:.4f}")
+                print(f"  Mean Hadamard energy: {eval_metrics['mean_hadamard_energy']:.4f}")
                 print(f"  Value range: {eval_metrics['value_range']}")
                 print(f"  Unique values: {len(eval_metrics['unique_values'])} ({eval_metrics['unique_values']})")
-                # Note: Binary rate is always 100% due to discrete sampling architecture
+
+                # Print detailed analysis if available
+                if 'denoising_analysis' in eval_metrics and eval_metrics['denoising_analysis']:
+                    denoising = eval_metrics['denoising_analysis']
+                    print(f"  Denoising: {denoising['initial_hadamard_energy']:.2f} → {denoising['final_hadamard_energy']:.2f}")
 
                 # Log evaluation metrics to wandb
                 if use_wandb:
-                    wandb.log({
+                    wandb_metrics = {
                         'eval/elbo_hadamard': eval_metrics['elbo_hadamard'],
-                        'eval/elbo_random': eval_metrics['elbo_random'],
-                        'eval/elbo_difference': eval_metrics['elbo_difference'],
                         'eval/orthogonal_rate': eval_metrics['orthogonal_rate'],
                         'eval/mean_orthogonal_error': eval_metrics['mean_orthogonal_error'],
+                        'eval/mean_hadamard_energy': eval_metrics['mean_hadamard_energy'],
+                        'eval/std_hadamard_energy': eval_metrics['std_hadamard_energy'],
                         'eval/binary_rate': eval_metrics.get('binary_rate', 1.0),
                         'eval/valid_hadamard_rate': eval_metrics.get('valid_hadamard_rate', 0.0),
                         'eval/num_unique_values': len(eval_metrics['unique_values']),
                         'eval/epoch': epoch + 1
-                    }, step=global_step)
+                    }
+
+                    # Add optional metrics
+                    if 'elbo_random' in eval_metrics:
+                        wandb_metrics.update({
+                            'eval/elbo_random': eval_metrics['elbo_random'],
+                            'eval/elbo_difference': eval_metrics['elbo_difference']
+                        })
+
+                    if 'denoising_analysis' in eval_metrics and eval_metrics['denoising_analysis']:
+                        denoising = eval_metrics['denoising_analysis']
+                        wandb_metrics.update({
+                            'eval/initial_hadamard_energy': denoising['initial_hadamard_energy'],
+                            'eval/final_hadamard_energy': denoising['final_hadamard_energy']
+                        })
+
+                    wandb.log(wandb_metrics, step=global_step)
 
             except Exception as e:
                 print(f"Evaluation failed: {e}")

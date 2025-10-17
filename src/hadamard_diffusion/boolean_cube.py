@@ -76,6 +76,10 @@ class BinaryUniformGraph:
         """Sample from limiting distribution (uniform over {-1, +1})"""
         indices = torch.randint(0, 2, batch_dims)
         return self.index_to_value(indices)
+
+    def sample_data_like(self, *batch_dims):
+        """Sample random binary matrices for evaluation baselines"""
+        return self.sample_limit(*batch_dims)
     
 
 
@@ -128,12 +132,17 @@ class BinaryAbsorbingGraph:
         return self.index_to_value(new_indices)
 
     def sample_limit(self, *batch_dims):
-        """Sample from limiting distribution (uniform over {-1, +1})"""
-        indices = torch.randint(0, 2, batch_dims)
+        """Sample from limiting distribution (all mask tokens for absorbing diffusion)
+
+        This is used for:
+        - Initializing sampling (reverse process starts here)
+        - Should NOT be used for training data or evaluation baselines
+        """
+        indices = torch.full(batch_dims, self.mask_token_id, dtype=torch.long)
         return self.index_to_value(indices)
 
-    def sample_prior(self, *batch_dims):
-        """Sample from prior distribution (all mask tokens)"""
-        indices = torch.full(batch_dims, self.mask_token_id, dtype=torch.long)
+    def sample_data_like(self, *batch_dims):
+        """Sample random binary matrices for evaluation baselines"""
+        indices = torch.randint(0, 2, batch_dims)
         return self.index_to_value(indices)
 
