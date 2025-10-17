@@ -1,3 +1,4 @@
+from functools import partial
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,9 +7,11 @@ from torch.cuda.amp import GradScaler, autocast
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+import wandb
 
-from .score_model import HadamardScoreModel, HadamardRADDModel, BinaryUniformGraph
-from .sampling import get_binary_sampler, validate_hadamard_properties
+from hadamard_diffusion.losses import score_entropy_loss_fn, t_dce_loss_fn, lambda_dce_loss_fn
+from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel, BinaryUniformGraph
+from hadamard_diffusion.sampling import get_binary_sampler, validate_hadamard_properties
 
 
 def reparameterized_schedule(t, t_critical=0.013, concentration=10.0):
@@ -69,7 +72,6 @@ class HadamardDataset(Dataset):
         matrix = self.matrices[idx]
         return torch.from_numpy(matrix).float()
 
-
 def get_loss_fn(graph, sampling_eps=1e-3, loss_type='score_entropy'):
     """Loss function for discrete diffusion training
 
@@ -79,110 +81,12 @@ def get_loss_fn(graph, sampling_eps=1e-3, loss_type='score_entropy'):
         loss_type: 'score_entropy', 't_dce', or 'lambda_dce'
     """
 
-    def loss_fn(model, batch):
-        batch_size = batch.shape[0]
-        device = batch.device
-
-        # Sample random timesteps
-        t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
-        sigma = t.unsqueeze(-1)  # Add dimension for broadcasting
-
-        # Sample noisy version
-        x_noisy = graph.sample_transition(batch, sigma)
-
-        # Get model prediction
-        log_scores = model(x_noisy, sigma)
-
-        # Compute score entropy loss
-        loss = graph.score_entropy(log_scores, sigma, x_noisy, batch)
-
-        # Take mean over spatial dimensions and batch
-        return loss.mean()
-
-    def t_dce_loss_fn(model, batch):
-        """t-DCE loss for time-independent models"""
-        batch_size = batch.shape[0]
-        device = batch.device
-
-        # Sample random timesteps
-        t = (1 - sampling_eps) * torch.rand(batch_size, device=device) + sampling_eps
-        sigma = t.unsqueeze(-1)
-
-        # Sample noisy version using absorbing diffusion
-        x_noisy = graph.sample_transition(batch, sigma)
-
-        # Get model prediction (conditional probabilities)
-        log_probs = model(x_noisy)  # No time conditioning
-
-        # Convert values to indices for gathering
-        x_indices = graph.value_to_index(batch)
-
-        # Mask for positions that were corrupted (different from clean)
-        corrupted_mask = (x_noisy != batch)
-
-        # Extract log probabilities for clean values at corrupted positions
-        batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1).unsqueeze(-1)
-        height_indices = torch.arange(batch.shape[1], device=device).unsqueeze(0).unsqueeze(-1)
-        width_indices = torch.arange(batch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
-
-        # Gather log probabilities for true values
-        neg_log_probs = -torch.gather(
-            log_probs[batch_indices, height_indices, width_indices],
-            -1,
-            x_indices.unsqueeze(-1)
-        ).squeeze(-1)
-
-        # Apply mask and compute loss only for corrupted positions
-        loss = torch.where(corrupted_mask, neg_log_probs, torch.zeros_like(neg_log_probs))
-
-        # Weight by noise level and take mean
-        sigma_flat = sigma.squeeze(-1)
-        esigma_minus_1 = torch.expm1(sigma_flat)
-        weighted_loss = loss * esigma_minus_1.unsqueeze(-1).unsqueeze(-1)
-
-        return weighted_loss.sum() / corrupted_mask.sum().clamp(min=1)
-
-    def lambda_dce_loss_fn(model, batch):
-        """λ-DCE loss for time-independent models"""
-        batch_size = batch.shape[0]
-        device = batch.device
-
-        # Sample λ uniformly from [0, 1]
-        lambda_vals = torch.rand(batch_size, device=device)
-
-        # Create corrupted version by flipping each element with probability λ
-        flip_probs = lambda_vals.unsqueeze(-1).unsqueeze(-1)
-        should_flip = torch.rand_like(batch.float()) < flip_probs
-        x_corrupted = torch.where(should_flip, -batch, batch)
-
-        # Get model prediction
-        log_probs = model(x_corrupted)
-
-        # Convert values to indices
-        x_indices = graph.value_to_index(batch)
-
-        # Extract log probabilities for clean values
-        batch_indices = torch.arange(batch_size, device=device).unsqueeze(-1).unsqueeze(-1)
-        height_indices = torch.arange(batch.shape[1], device=device).unsqueeze(0).unsqueeze(-1)
-        width_indices = torch.arange(batch.shape[2], device=device).unsqueeze(0).unsqueeze(0)
-
-        log_probs_clean = torch.gather(
-            log_probs[batch_indices, height_indices, width_indices],
-            -1,
-            x_indices.unsqueeze(-1)
-        ).squeeze(-1)
-
-        # Compute λ-DCE loss: -E[log p(x|x_corrupted)] / λ
-        loss_per_sample = -log_probs_clean.sum(dim=(-2, -1)) / lambda_vals.clamp(min=sampling_eps)
-
-        return loss_per_sample.mean()
-
     if loss_type == 'score_entropy':
-        return loss_fn
+        return partial(score_entropy_loss_fn, graph, sampling_eps)
     elif loss_type == 't_dce':
-        return t_dce_loss_fn
+        return partial(t_dce_loss_fn, graph, sampling_eps)
     elif loss_type == 'lambda_dce':
-        return lambda_dce_loss_fn
+        return partial(lambda_dce_loss_fn, graph, sampling_eps)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -365,7 +269,10 @@ def train_hadamard_diffusion(
     eval_interval=5,
     eval_batch_size=8,
     model_type='score',  # 'score' or 'radd'
-    loss_type=None  # Auto-select based on model_type if None
+    loss_type=None,  # Auto-select based on model_type if None
+    use_wandb=True,
+    wandb_project="hadamard-diffusion",
+    wandb_run_name=None
 ):
     """
     Train Hadamard diffusion model
@@ -377,12 +284,17 @@ def train_hadamard_diffusion(
         lr: Learning rate
         max_matrices: Maximum number of matrices to load (None for all)
         matrix_size: Size of Hadamard matrices
-        model_kwargs: Additional arguments for HadamardScoreModel
+        model_kwargs: Additional arguments for HadamardScoreModel/HadamardRADDModel
         device: Device to train on
         save_dir: Directory to save checkpoints
         log_interval: Steps between logging
         eval_interval: Epochs between evaluation
         eval_batch_size: Batch size for evaluation
+        model_type: 'score' (time-dependent) or 'radd' (time-independent)
+        loss_type: 'score_entropy', 't_dce', or 'lambda_dce' (auto-selected if None)
+        use_wandb: Whether to use Weights & Biases logging
+        wandb_project: W&B project name
+        wandb_run_name: W&B run name (auto-generated if None)
     """
 
     if device is None:
@@ -433,6 +345,30 @@ def train_hadamard_diffusion(
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Training batches per epoch: {len(dataloader)}")
 
+    # Initialize wandb logging
+    if use_wandb:
+        config = {
+            'model_type': model_type,
+            'loss_type': loss_type or default_loss_type,
+            'matrix_size': matrix_size,
+            'num_epochs': num_epochs,
+            'batch_size': batch_size,
+            'learning_rate': lr,
+            'max_matrices': max_matrices,
+            'model_parameters': sum(p.numel() for p in model.parameters()),
+            'device': str(device),
+            **model_kwargs
+        }
+
+        run_name = wandb_run_name or f"{model_type}_{loss_type or default_loss_type}_{matrix_size}x{matrix_size}"
+        wandb.init(
+            project=wandb_project,
+            name=run_name,
+            config=config,
+            tags=[model_type, loss_type or default_loss_type, f"size_{matrix_size}"]
+        )
+        wandb.watch(model, log="all", log_freq=log_interval)
+
     # Training loop
     model.train()
     global_step = 0
@@ -477,6 +413,15 @@ def train_hadamard_diffusion(
                     'step': global_step
                 })
 
+                # Log to wandb
+                if use_wandb:
+                    wandb.log({
+                        'train/loss': avg_loss,
+                        'train/learning_rate': lr,
+                        'train/epoch': epoch + 1,
+                        'train/step': global_step
+                    }, step=global_step)
+
         # Evaluation
         if (epoch + 1) % eval_interval == 0:
             print(f"\nRunning evaluation after epoch {epoch + 1}...")
@@ -504,6 +449,20 @@ def train_hadamard_diffusion(
                 print(f"  Unique values: {len(eval_metrics['unique_values'])} ({eval_metrics['unique_values']})")
                 # Note: Binary rate is always 100% due to discrete sampling architecture
 
+                # Log evaluation metrics to wandb
+                if use_wandb:
+                    wandb.log({
+                        'eval/elbo_hadamard': eval_metrics['elbo_hadamard'],
+                        'eval/elbo_random': eval_metrics['elbo_random'],
+                        'eval/elbo_difference': eval_metrics['elbo_difference'],
+                        'eval/orthogonal_rate': eval_metrics['orthogonal_rate'],
+                        'eval/mean_orthogonal_error': eval_metrics['mean_orthogonal_error'],
+                        'eval/binary_rate': eval_metrics.get('binary_rate', 1.0),
+                        'eval/valid_hadamard_rate': eval_metrics.get('valid_hadamard_rate', 0.0),
+                        'eval/num_unique_values': len(eval_metrics['unique_values']),
+                        'eval/epoch': epoch + 1
+                    }, step=global_step)
+
             except Exception as e:
                 print(f"Evaluation failed: {e}")
 
@@ -530,6 +489,13 @@ def train_hadamard_diffusion(
 
         print(f"Epoch {epoch+1} completed. Average loss: {epoch_loss/num_batches:.4f}")
 
+        # Log epoch summary to wandb
+        if use_wandb:
+            wandb.log({
+                'epoch/avg_loss': epoch_loss / num_batches,
+                'epoch/number': epoch + 1
+            }, step=global_step)
+
     # Save final model
     checkpoint = {
         'epoch': num_epochs,
@@ -545,6 +511,10 @@ def train_hadamard_diffusion(
     }
     torch.save(checkpoint, Path(save_dir) / "final_model.pt")
     print(f"Training completed. Final model saved to {save_dir}/final_model.pt")
+
+    # Finish wandb run
+    if use_wandb:
+        wandb.finish()
 
     return model, ema
 
@@ -590,6 +560,8 @@ if __name__ == "__main__":
         model_type='score',
         loss_type='score_entropy',
         save_dir="checkpoints_score",
+        use_wandb=True,
+        wandb_run_name="score_model_test",
         model_kwargs={
             'element_dim': 64,
             'pool_dim': 32,
@@ -611,6 +583,8 @@ if __name__ == "__main__":
         model_type='radd',
         loss_type='t_dce',
         save_dir="checkpoints_radd",
+        use_wandb=True,
+        wandb_run_name="radd_t_dce_test",
         model_kwargs={
             'element_dim': 64,
             'pool_dim': 32,
@@ -632,6 +606,8 @@ if __name__ == "__main__":
         model_type='radd',
         loss_type='lambda_dce',
         save_dir="checkpoints_radd_lambda",
+        use_wandb=True,
+        wandb_run_name="radd_lambda_dce_test",
         model_kwargs={
             'element_dim': 64,
             'pool_dim': 32,
