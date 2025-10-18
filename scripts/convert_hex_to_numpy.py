@@ -6,14 +6,9 @@ This script processes all subdirectories in data/raw/, loads the hex-encoded
 Hadamard matrices, and saves them as numpy arrays with shape (250000, 32, 32)
 in data/numpy/.
 """
-
-import os
-import sys
 import numpy as np
 from pathlib import Path
 
-# Add src to path to import our utilities
-sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from hadamard_diffusion.data import load_all_hex_hadamard_matrices
 
@@ -101,7 +96,7 @@ def process_matrices_in_batches(raw_data_dir, batch_size=250000, output_dir=None
         save_current_batch()
 
     total_batches = batch_number - 1
-    print(f"\n🎉 Processing complete!")
+    print(f"Processing complete!")
     print(f"   Total matrices processed: {total_processed}")
     print(f"   Total batches created: {total_batches}")
     print(f"   Output files: hadamard_matrices_batch_001.npy to hadamard_matrices_batch_{total_batches:03d}.npy")
@@ -196,7 +191,7 @@ def main():
             is_valid = np.allclose(product, expected)
             print(f"    Matrix {i}: Valid Hadamard = {is_valid}")
 
-    print(f"\n🎉 All done!")
+    print(f"All done!")
     print(f"   Created {total_batches} batch files")
     print(f"   Each file contains up to 250,000 matrices")
     print(f"   Files: hadamard_matrices_batch_001.npy to hadamard_matrices_batch_{total_batches:03d}.npy")
