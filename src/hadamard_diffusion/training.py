@@ -2,14 +2,13 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import wandb
-import boto3
-import io
 
+from hadamard_diffusion.dataloader import PreShuffledHadamardDataset
 from hadamard_diffusion.losses import score_entropy_loss_fn, t_dce_loss_fn, lambda_dce_loss_fn
 from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel
 from hadamard_diffusion.boolean_cube import BinaryUniformGraph, BinaryAbsorbingGraph
@@ -38,79 +37,6 @@ def reparameterized_schedule(t, t_critical=0.013, concentration=10.0):
     return np.clip(reparameterized_t, 0, 1)
 
 
-
-
-class HadamardDataset(Dataset):
-    """Dataset for loading Hadamard matrices from numpy files (local or S3)"""
-
-    def __init__(self, data_source, max_matrices=None, s3_bucket=None):
-        """
-        Args:
-            data_source: Path to local directory or S3 prefix
-            max_matrices: Maximum number of matrices to load
-            s3_bucket: S3 bucket name (if None, assumes local loading)
-        """
-        self.data_source = data_source
-        self.max_matrices = max_matrices
-        self.s3_bucket = s3_bucket
-        self.is_s3 = s3_bucket is not None
-
-        if self.is_s3:
-            self.s3_client = boto3.client('s3')
-            self.matrix_files = self._list_s3_files()
-        else:
-            self.data_dir = Path(data_source)
-            self.matrix_files = list(self.data_dir.glob("hadamard_matrices_batch_*.npy"))
-
-        # Load all matrices (or subset)
-        self.matrices = []
-        total_loaded = 0
-
-        for file_path in sorted(self.matrix_files):
-            if self.is_s3:
-                batch_matrices = self._load_from_s3(file_path)
-            else:
-                batch_matrices = np.load(file_path)
-
-            if self.max_matrices and total_loaded + len(batch_matrices) > self.max_matrices:
-                # Take only what we need
-                remaining = self.max_matrices - total_loaded
-                batch_matrices = batch_matrices[:remaining]
-
-            self.matrices.extend(batch_matrices)
-            total_loaded += len(batch_matrices)
-
-            if self.max_matrices and total_loaded >= self.max_matrices:
-                break
-
-        print(f"Loaded {len(self.matrices)} Hadamard matrices from {'S3' if self.is_s3 else 'local'}")
-
-    def _list_s3_files(self):
-        """List numpy files in S3 bucket with the given prefix"""
-        files = []
-        paginator = self.s3_client.get_paginator('list_objects_v2')
-
-        for page in paginator.paginate(Bucket=self.s3_bucket, Prefix=self.data_source):
-            if 'Contents' in page:
-                for obj in page['Contents']:
-                    key = obj['Key']
-                    if key.endswith('.npy') and 'hadamard_matrices_batch_' in key:
-                        files.append(key)
-
-        return files
-
-    def _load_from_s3(self, s3_key):
-        """Load numpy array from S3"""
-        response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
-        buffer = io.BytesIO(response['Body'].read())
-        return np.load(buffer)
-
-    def __len__(self):
-        return len(self.matrices)
-
-    def __getitem__(self, idx):
-        matrix = self.matrices[idx]
-        return torch.from_numpy(matrix).float()
 
 def get_loss_fn(graph, sampling_eps=1e-3, loss_type='score_entropy'):
     """Loss function for discrete diffusion training
