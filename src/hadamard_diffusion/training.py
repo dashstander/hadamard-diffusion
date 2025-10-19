@@ -846,7 +846,7 @@ def train_hadamard_diffusion_preshuffled(
                 scheduler.step()
 
                 # Update EMA
-                ema.update()
+                ema.update(model)
 
                 epoch_loss += loss.item()
                 num_batches += 1
