@@ -55,7 +55,7 @@ def main():
     print(f"Learning rate: {args.lr}")
     print(f"Model: RADD (Time-independent)")
     print(f"Graph: Absorbing diffusion")
-    print(f"Element hidden dim: {model_kwargs['element_dim_dim']}")
+    print(f"Element hidden dim: {model_kwargs['element_dim']}")
     print(f"Row/Column hidden dim: {model_kwargs['pool_dim']}")
     print(f"Layers: {model_kwargs['num_layers']}")
     print("=" * 60)
