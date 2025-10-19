@@ -938,13 +938,14 @@ def train_hadamard_diffusion_preshuffled(
 
     # Final evaluation
     print("Running final evaluation...")
-    with ema.ema_scope():
-        final_metrics = evaluate_model(
-            model, eval_batch, graph, device,
-            matrix_size=matrix_size,
-            num_eval_samples=8,
-            compute_denoising_trajectory=True
-        )
+    ema.apply_shadow(model)
+    final_metrics = evaluate_model(
+        model, eval_batch, graph, device,
+        matrix_size=matrix_size,
+        num_eval_samples=8,
+        compute_denoising_trajectory=True
+    )
+    ema.restore(model)
 
     if use_wandb:
         wandb.log({**{f'final/{k}': v for k, v in final_metrics.items()}})
