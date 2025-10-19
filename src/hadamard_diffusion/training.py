@@ -528,7 +528,7 @@ def train_hadamard_diffusion(
             optimizer.zero_grad()
 
             # Forward pass with mixed precision
-            with torch.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 loss = loss_fn(model, batch)
 
             # Backward pass
@@ -837,7 +837,7 @@ def train_hadamard_diffusion_preshuffled(
 
                 optimizer.zero_grad()
 
-                with torch.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     loss = loss_fn(model, batch)
 
                 scaler.scale(loss).backward()
