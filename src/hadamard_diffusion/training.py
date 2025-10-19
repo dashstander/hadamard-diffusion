@@ -242,7 +242,7 @@ def compute_elbo(model, x_clean, graph, sampling_eps=1e-3, num_samples=50, retur
 
 
 def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_samples=4,
-                   include_random_comparison=True, detailed_analysis=True):
+                   include_random_comparison=False, detailed_analysis=True):
     """
     Comprehensive evaluation: ELBO + sampling + Hadamard validation
 
@@ -883,8 +883,7 @@ def train_hadamard_diffusion_preshuffled(
                         eval_metrics = evaluate_model(
                             model, eval_batch, graph, device,
                             matrix_size=matrix_size,
-                            num_eval_samples=4,
-                            compute_denoising_trajectory=True
+                            num_eval_samples=4
                         )
 
                         current_eval_loss = eval_metrics['elbo/mean']
@@ -942,8 +941,7 @@ def train_hadamard_diffusion_preshuffled(
     final_metrics = evaluate_model(
         model, eval_batch, graph, device,
         matrix_size=matrix_size,
-        num_eval_samples=8,
-        compute_denoising_trajectory=True
+        num_eval_samples=8
     )
     ema.restore(model)
 
