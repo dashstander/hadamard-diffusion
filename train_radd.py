@@ -37,7 +37,12 @@ def main():
 
     # Hyperparameters for RADD training
     model_kwargs = {
-        'hidden_dim': 256,
+        'element_dim': 128,
+        'hidden_dim': 512,
+        'ffn_hidden_dim': 2048,
+        'pool_dim': 128,
+        'num_heads': 8,
+        'head_dim': 64,
         'num_layers': 6
     }
 
