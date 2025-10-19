@@ -879,13 +879,13 @@ def train_hadamard_diffusion_preshuffled(
                     # Step-based evaluation
                     if global_step % eval_step_interval == 0:
                         print("\nRunning evaluation...")
-                        with ema.ema_scope():
-                            eval_metrics = evaluate_model(
-                                model, eval_batch, graph, device,
-                                matrix_size=matrix_size,
-                                num_eval_samples=4,
-                                compute_denoising_trajectory=True
-                            )
+                        ema.apply_shadow(model)
+                        eval_metrics = evaluate_model(
+                            model, eval_batch, graph, device,
+                            matrix_size=matrix_size,
+                            num_eval_samples=4,
+                            compute_denoising_trajectory=True
+                        )
 
                         current_eval_loss = eval_metrics['elbo/mean']
                         print(f"Evaluation - ELBO: {current_eval_loss:.4f}")
@@ -911,6 +911,7 @@ def train_hadamard_diffusion_preshuffled(
                                 'matrix_size': matrix_size
                             }, checkpoint_path)
                             print(f"Saved best model to {checkpoint_path}")
+                        ema.restore(model)
 
             except StopIteration:
                 # End of epoch
