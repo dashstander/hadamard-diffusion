@@ -837,7 +837,7 @@ def train_hadamard_diffusion_preshuffled(
 
                 optimizer.zero_grad()
 
-                with autocast():
+                with torch.amp.autocast():
                     loss = loss_fn(model, batch)
 
                 scaler.scale(loss).backward()
