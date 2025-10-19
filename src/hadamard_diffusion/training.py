@@ -422,7 +422,7 @@ def train_hadamard_diffusion(
         device: Device to train on
         save_dir: Directory to save checkpoints
         log_interval: Steps between logging
-        eval_interval: Epochs between evaluation
+        eval_step_interval: Global steps between evaluation
         eval_batch_size: Batch size for evaluation
         model_type: 'score' (time-dependent) or 'radd' (time-independent)
         loss_type: 'score_entropy', 't_dce', or 'lambda_dce' (auto-selected if None)
@@ -699,7 +699,7 @@ def train_hadamard_diffusion_preshuffled(
     device=None,
     save_dir="checkpoints",
     log_interval=1,
-    eval_interval=5,
+    eval_step_interval=500,
     eval_batch_size=8,
     model_type='score',  # 'score' or 'radd'
     loss_type=None,  # Auto-select based on model_type if None
@@ -724,7 +724,7 @@ def train_hadamard_diffusion_preshuffled(
         device: Device to train on
         save_dir: Directory to save checkpoints
         log_interval: Steps between logging
-        eval_interval: Epochs between evaluation
+        eval_step_interval: Global steps between evaluation
         eval_batch_size: Batch size for evaluation
         model_type: 'score' (time-dependent) or 'radd' (time-independent)
         loss_type: 'score_entropy', 't_dce', or 'lambda_dce' (auto-selected if None)
@@ -831,82 +831,90 @@ def train_hadamard_diffusion_preshuffled(
         # Create fresh iterator for each epoch
         train_iter = iter(train_dataset)
 
-        try:
-            while True:
-                batch = next(train_iter).to(device)
+        # Create progress bar for this epoch
+        with tqdm(desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch") as pbar:
+            try:
+                while True:
+                    batch = next(train_iter).to(device)
 
-                optimizer.zero_grad()
+                    optimizer.zero_grad()
 
-                with torch.amp.autocast('cuda'):
-                    loss = loss_fn(model, batch)
+                    with torch.amp.autocast('cuda'):
+                        loss = loss_fn(model, batch)
 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
 
-                # Update EMA
-                ema.update(model)
+                    # Update EMA
+                    ema.update(model)
 
-                epoch_loss += loss.item()
-                num_batches += 1
-                global_step += 1
+                    epoch_loss += loss.item()
+                    num_batches += 1
+                    global_step += 1
 
-                # Logging
-                if global_step % log_interval == 0:
+                    # Update progress bar
                     avg_loss = epoch_loss / num_batches
                     current_lr = scheduler.get_last_lr()[0]
+                    pbar.set_postfix({
+                        'loss': f"{loss.item():.4f}",
+                        'avg_loss': f"{avg_loss:.4f}",
+                        'lr': f"{current_lr:.2e}",
+                        'step': global_step
+                    })
+                    pbar.update(1)
 
-                    print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, "
-                          f"Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
+                    # Logging
+                    if global_step % log_interval == 0:
+                        if use_wandb:
+                            wandb.log({
+                                'train/loss': loss.item(),
+                                'train/avg_loss': avg_loss,
+                                'train/learning_rate': current_lr,
+                                'train/epoch': epoch + 1,
+                                'train/global_step': global_step
+                            })
 
-                    if use_wandb:
-                        wandb.log({
-                            'train/loss': loss.item(),
-                            'train/avg_loss': avg_loss,
-                            'train/learning_rate': current_lr,
-                            'train/epoch': epoch + 1,
-                            'train/global_step': global_step
-                        })
+                    # Step-based evaluation
+                    if global_step % eval_step_interval == 0:
+                        print("\nRunning evaluation...")
+                        with ema.ema_scope():
+                            eval_metrics = evaluate_model(
+                                model, eval_batch, graph, device,
+                                matrix_size=matrix_size,
+                                num_eval_samples=4,
+                                compute_denoising_trajectory=True
+                            )
 
-        except StopIteration:
-            # End of epoch
-            pass
+                        current_eval_loss = eval_metrics['elbo/mean']
+                        print(f"Evaluation - ELBO: {current_eval_loss:.4f}")
 
-        # Evaluation
-        if (epoch + 1) % eval_interval == 0:
-            print("Running evaluation...")
-            with ema.ema_scope():
-                eval_metrics = evaluate_model(
-                    model, eval_batch, graph, device,
-                    matrix_size=matrix_size,
-                    num_eval_samples=4,
-                    compute_denoising_trajectory=True
-                )
+                        if use_wandb:
+                            wandb.log({**eval_metrics, 'eval/global_step': global_step})
 
-            current_eval_loss = eval_metrics['elbo/mean']
-            print(f"Evaluation - ELBO: {current_eval_loss:.4f}")
+                        # Save best model
+                        if current_eval_loss < best_eval_loss:
+                            best_eval_loss = current_eval_loss
+                            checkpoint_path = Path(save_dir) / f"best_model_step_{global_step}.pt"
+                            torch.save({
+                                'epoch': epoch,
+                                'global_step': global_step,
+                                'model_state_dict': model.state_dict(),
+                                'ema_state_dict': ema.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'scheduler_state_dict': scheduler.state_dict(),
+                                'loss': best_eval_loss,
+                                'model_kwargs': model_kwargs,
+                                'model_type': model_type,
+                                'graph_type': graph_type,
+                                'matrix_size': matrix_size
+                            }, checkpoint_path)
+                            print(f"Saved best model to {checkpoint_path}")
 
-            if use_wandb:
-                wandb.log({**eval_metrics, 'eval/epoch': epoch + 1})
-
-            # Save best model
-            if current_eval_loss < best_eval_loss:
-                best_eval_loss = current_eval_loss
-                checkpoint_path = Path(save_dir) / f"best_model_epoch_{epoch+1}.pt"
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'ema_state_dict': ema.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'loss': best_eval_loss,
-                    'model_kwargs': model_kwargs,
-                    'model_type': model_type,
-                    'graph_type': graph_type,
-                    'matrix_size': matrix_size
-                }, checkpoint_path)
-                print(f"Saved best model to {checkpoint_path}")
+            except StopIteration:
+                # End of epoch
+                pass
 
         # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:

@@ -32,6 +32,8 @@ def main():
                        help="Directory to save checkpoints (default: checkpoints)")
     parser.add_argument("--run-name", default=None,
                        help="W&B run name (auto-generated if not provided)")
+    parser.add_argument("--eval-steps", type=int, default=500,
+                       help="Evaluate every N steps (default: 500)")
 
     args = parser.parse_args()
 
@@ -70,7 +72,7 @@ def main():
         model_kwargs=model_kwargs,
         save_dir=args.save_dir,
         log_interval=50,
-        eval_interval=5,
+        eval_step_interval=args.eval_steps,
         eval_batch_size=16,
         model_type='radd',           # Time-independent RADD model
         loss_type='t_dce',           # t-DCE loss for RADD
