@@ -8,7 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 import wandb
 
-from hadamard_diffusion.dataloader import PreShuffledHadamardDataset
+from hadamard_diffusion.dataloader import PreShuffledHadamardDataset, create_train_eval_datasets
 from hadamard_diffusion.losses import score_entropy_loss_fn, t_dce_loss_fn, lambda_dce_loss_fn
 from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel
 from hadamard_diffusion.boolean_cube import BinaryUniformGraph, BinaryAbsorbingGraph
@@ -687,6 +687,261 @@ def train_hadamard_diffusion(
         wandb.finish()
 
     return model, ema
+
+
+def train_hadamard_diffusion_preshuffled(
+    file_path,
+    num_epochs=100,
+    batch_size=32,
+    lr=1e-4,
+    matrix_size=32,
+    model_kwargs=None,
+    device=None,
+    save_dir="checkpoints",
+    log_interval=100,
+    eval_interval=5,
+    eval_batch_size=8,
+    model_type='score',  # 'score' or 'radd'
+    loss_type=None,  # Auto-select based on model_type if None
+    graph_type='uniform',  # 'uniform' or 'absorbing'
+    use_wandb=True,
+    wandb_project="hadamard-diffusion",
+    wandb_run_name=None,
+    eval_fraction=0.1,
+    train_seed=42,
+    eval_seed=43
+):
+    """
+    Train Hadamard diffusion model using pre-shuffled numpy file
+
+    Args:
+        file_path: Path to pre-shuffled numpy memmap file
+        num_epochs: Number of training epochs
+        batch_size: Batch size for training
+        lr: Learning rate
+        matrix_size: Size of Hadamard matrices
+        model_kwargs: Additional arguments for HadamardScoreModel/HadamardRADDModel
+        device: Device to train on
+        save_dir: Directory to save checkpoints
+        log_interval: Steps between logging
+        eval_interval: Epochs between evaluation
+        eval_batch_size: Batch size for evaluation
+        model_type: 'score' (time-dependent) or 'radd' (time-independent)
+        loss_type: 'score_entropy', 't_dce', or 'lambda_dce' (auto-selected if None)
+        graph_type: 'uniform' (uniform diffusion) or 'absorbing' (absorbing diffusion)
+        use_wandb: Whether to use Weights & Biases logging
+        wandb_project: W&B project name
+        wandb_run_name: W&B run name (auto-generated if None)
+        eval_fraction: Fraction of data to use for evaluation
+        train_seed: Random seed for training transformations
+        eval_seed: Random seed for evaluation transformations
+    """
+
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print(f"Training on device: {device}")
+
+    # Create directories
+    Path(save_dir).mkdir(exist_ok=True)
+
+    # Create train/eval datasets from pre-shuffled file
+    train_dataset, eval_dataset = create_train_eval_datasets(
+        file_path=file_path,
+        batch_size=batch_size,
+        train_seed=train_seed,
+        eval_seed=eval_seed,
+        eval_fraction=eval_fraction
+    )
+
+    # Get a fixed evaluation batch for consistent monitoring
+    eval_iter = iter(eval_dataset)
+    eval_batch = next(eval_iter).to(device)
+
+    # Initialize model and graph
+    model_kwargs = model_kwargs or {}
+    if model_type == 'score':
+        model = HadamardScoreModel(matrix_size=matrix_size, **model_kwargs).to(device)
+        default_loss_type = 'score_entropy'
+    elif model_type == 'radd':
+        model = HadamardRADDModel(matrix_size=matrix_size, **model_kwargs).to(device)
+        default_loss_type = 't_dce'
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+    # Initialize graph
+    if graph_type == 'uniform':
+        graph = BinaryUniformGraph()
+    elif graph_type == 'absorbing':
+        graph = BinaryAbsorbingGraph()
+    else:
+        raise ValueError(f"Unknown graph type: {graph_type}")
+
+    # Initialize optimizer and loss
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    loss_fn = get_loss_fn(graph, loss_type=loss_type or default_loss_type)
+    scaler = torch.cuda.amp.GradScaler()
+    ema = EMA(model)
+
+    # Learning rate scheduler - estimate steps per epoch
+    estimated_steps_per_epoch = len(train_dataset) // batch_size
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * estimated_steps_per_epoch)
+
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Estimated training batches per epoch: {estimated_steps_per_epoch}")
+
+    # Initialize wandb logging
+    if use_wandb:
+        config = {
+            'model_type': model_type,
+            'loss_type': loss_type or default_loss_type,
+            'graph_type': graph_type,
+            'matrix_size': matrix_size,
+            'num_epochs': num_epochs,
+            'batch_size': batch_size,
+            'learning_rate': lr,
+            'eval_fraction': eval_fraction,
+            'train_seed': train_seed,
+            'eval_seed': eval_seed,
+            'total_train_matrices': len(train_dataset),
+            'total_eval_matrices': len(eval_dataset)
+        }
+
+        if model_kwargs:
+            config.update({f'model_{k}': v for k, v in model_kwargs.items()})
+
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            config=config
+        )
+
+        # Log model architecture
+        wandb.watch(model, log_freq=log_interval)
+
+    # Training loop
+    global_step = 0
+    best_eval_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+
+        # Create fresh iterator for each epoch
+        train_iter = iter(train_dataset)
+
+        try:
+            while True:
+                batch = next(train_iter).to(device)
+
+                optimizer.zero_grad()
+
+                with autocast():
+                    loss = loss_fn(model, batch)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+
+                # Update EMA
+                ema.update()
+
+                epoch_loss += loss.item()
+                num_batches += 1
+                global_step += 1
+
+                # Logging
+                if global_step % log_interval == 0:
+                    avg_loss = epoch_loss / num_batches
+                    current_lr = scheduler.get_last_lr()[0]
+
+                    print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, "
+                          f"Loss: {loss.item():.4f}, Avg Loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
+
+                    if use_wandb:
+                        wandb.log({
+                            'train/loss': loss.item(),
+                            'train/avg_loss': avg_loss,
+                            'train/learning_rate': current_lr,
+                            'train/epoch': epoch + 1,
+                            'train/global_step': global_step
+                        })
+
+        except StopIteration:
+            # End of epoch
+            pass
+
+        # Evaluation
+        if (epoch + 1) % eval_interval == 0:
+            print("Running evaluation...")
+            with ema.ema_scope():
+                eval_metrics = evaluate_model(
+                    model, eval_batch, graph, device,
+                    matrix_size=matrix_size,
+                    num_eval_samples=4,
+                    compute_denoising_trajectory=True
+                )
+
+            current_eval_loss = eval_metrics['elbo/mean']
+            print(f"Evaluation - ELBO: {current_eval_loss:.4f}")
+
+            if use_wandb:
+                wandb.log({**eval_metrics, 'eval/epoch': epoch + 1})
+
+            # Save best model
+            if current_eval_loss < best_eval_loss:
+                best_eval_loss = current_eval_loss
+                checkpoint_path = Path(save_dir) / f"best_model_epoch_{epoch+1}.pt"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'ema_state_dict': ema.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss': best_eval_loss,
+                    'model_kwargs': model_kwargs,
+                    'model_type': model_type,
+                    'graph_type': graph_type,
+                    'matrix_size': matrix_size
+                }, checkpoint_path)
+                print(f"Saved best model to {checkpoint_path}")
+
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = Path(save_dir) / f"checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'ema_state_dict': ema.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': epoch_loss / max(num_batches, 1),
+                'model_kwargs': model_kwargs,
+                'model_type': model_type,
+                'graph_type': graph_type,
+                'matrix_size': matrix_size
+            }, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+
+    print("Training completed!")
+
+    # Final evaluation
+    print("Running final evaluation...")
+    with ema.ema_scope():
+        final_metrics = evaluate_model(
+            model, eval_batch, graph, device,
+            matrix_size=matrix_size,
+            num_eval_samples=8,
+            compute_denoising_trajectory=True
+        )
+
+    if use_wandb:
+        wandb.log({**{f'final/{k}': v for k, v in final_metrics.items()}})
+        wandb.finish()
+
+    return model, final_metrics
 
 
 def load_model(checkpoint_path, device=None):
