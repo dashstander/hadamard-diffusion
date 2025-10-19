@@ -3,11 +3,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import wandb
+import boto3
+import io
 
 from hadamard_diffusion.losses import score_entropy_loss_fn, t_dce_loss_fn, lambda_dce_loss_fn
 from hadamard_diffusion.score_model import HadamardScoreModel, HadamardRADDModel
@@ -40,19 +41,37 @@ def reparameterized_schedule(t, t_critical=0.013, concentration=10.0):
 
 
 class HadamardDataset(Dataset):
-    """Dataset for loading Hadamard matrices from numpy files"""
+    """Dataset for loading Hadamard matrices from numpy files (local or S3)"""
 
-    def __init__(self, data_dir, max_matrices=None):
-        self.data_dir = Path(data_dir)
-        self.matrix_files = list(self.data_dir.glob("hadamard_matrices_batch_*.npy"))
+    def __init__(self, data_source, max_matrices=None, s3_bucket=None):
+        """
+        Args:
+            data_source: Path to local directory or S3 prefix
+            max_matrices: Maximum number of matrices to load
+            s3_bucket: S3 bucket name (if None, assumes local loading)
+        """
+        self.data_source = data_source
         self.max_matrices = max_matrices
+        self.s3_bucket = s3_bucket
+        self.is_s3 = s3_bucket is not None
+
+        if self.is_s3:
+            self.s3_client = boto3.client('s3')
+            self.matrix_files = self._list_s3_files()
+        else:
+            self.data_dir = Path(data_source)
+            self.matrix_files = list(self.data_dir.glob("hadamard_matrices_batch_*.npy"))
 
         # Load all matrices (or subset)
         self.matrices = []
         total_loaded = 0
 
         for file_path in sorted(self.matrix_files):
-            batch_matrices = np.load(file_path)
+            if self.is_s3:
+                batch_matrices = self._load_from_s3(file_path)
+            else:
+                batch_matrices = np.load(file_path)
+
             if self.max_matrices and total_loaded + len(batch_matrices) > self.max_matrices:
                 # Take only what we need
                 remaining = self.max_matrices - total_loaded
@@ -64,7 +83,27 @@ class HadamardDataset(Dataset):
             if self.max_matrices and total_loaded >= self.max_matrices:
                 break
 
-        print(f"Loaded {len(self.matrices)} Hadamard matrices")
+        print(f"Loaded {len(self.matrices)} Hadamard matrices from {'S3' if self.is_s3 else 'local'}")
+
+    def _list_s3_files(self):
+        """List numpy files in S3 bucket with the given prefix"""
+        files = []
+        paginator = self.s3_client.get_paginator('list_objects_v2')
+
+        for page in paginator.paginate(Bucket=self.s3_bucket, Prefix=self.data_source):
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    key = obj['Key']
+                    if key.endswith('.npy') and 'hadamard_matrices_batch_' in key:
+                        files.append(key)
+
+        return files
+
+    def _load_from_s3(self, s3_key):
+        """Load numpy array from S3"""
+        response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
+        buffer = io.BytesIO(response['Body'].read())
+        return np.load(buffer)
 
     def __len__(self):
         return len(self.matrices)
@@ -423,7 +462,7 @@ class EMA:
 
 
 def train_hadamard_diffusion(
-    data_dir,
+    data_source,
     num_epochs=100,
     batch_size=32,
     lr=1e-4,
@@ -440,13 +479,14 @@ def train_hadamard_diffusion(
     graph_type='uniform',  # 'uniform' or 'absorbing'
     use_wandb=True,
     wandb_project="hadamard-diffusion",
-    wandb_run_name=None
+    wandb_run_name=None,
+    s3_bucket=None  # S3 bucket name (if None, assumes local loading)
 ):
     """
     Train Hadamard diffusion model
 
     Args:
-        data_dir: Directory containing hadamard_matrices_batch_*.npy files
+        data_source: Local directory or S3 prefix containing hadamard_matrices_batch_*.npy files
         num_epochs: Number of training epochs
         batch_size: Batch size for training
         lr: Learning rate
@@ -464,6 +504,7 @@ def train_hadamard_diffusion(
         use_wandb: Whether to use Weights & Biases logging
         wandb_project: W&B project name
         wandb_run_name: W&B run name (auto-generated if None)
+        s3_bucket: S3 bucket name (if None, assumes local loading)
     """
 
     if device is None:
@@ -475,7 +516,7 @@ def train_hadamard_diffusion(
     Path(save_dir).mkdir(exist_ok=True)
 
     # Initialize dataset and split into train/eval
-    dataset = HadamardDataset(data_dir, max_matrices=max_matrices)
+    dataset = HadamardDataset(data_source, max_matrices=max_matrices, s3_bucket=s3_bucket)
 
     # Create train/eval split (90/10)
     train_size = int(0.9 * len(dataset))
@@ -511,7 +552,7 @@ def train_hadamard_diffusion(
     # Initialize optimizer and loss
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = get_loss_fn(graph, loss_type=loss_type or default_loss_type)
-    scaler = GradScaler()
+    scaler = torch.cuda.amp.GradScaler()
     ema = EMA(model)
 
     # Learning rate scheduler
@@ -561,7 +602,7 @@ def train_hadamard_diffusion(
             optimizer.zero_grad()
 
             # Forward pass with mixed precision
-            with autocast():
+            with torch.amp.autocast():
                 loss = loss_fn(model, batch)
 
             # Backward pass

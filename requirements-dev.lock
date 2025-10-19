@@ -36,6 +36,11 @@ beautifulsoup4==4.13.5
     # via nbconvert
 bleach==6.2.0
     # via nbconvert
+boto3==1.40.55
+    # via hadamard-diffusion
+botocore==1.40.55
+    # via boto3
+    # via s3transfer
 certifi==2025.8.3
     # via httpcore
     # via httpx
@@ -106,6 +111,9 @@ jinja2==3.1.6
     # via jupyterlab-server
     # via nbconvert
     # via torch
+jmespath==1.0.1
+    # via boto3
+    # via botocore
 json5==0.12.1
     # via jupyterlab-server
 jsonpointer==3.0.0
@@ -234,6 +242,7 @@ pyparsing==3.2.4
     # via matplotlib
 python-dateutil==2.9.0.post0
     # via arrow
+    # via botocore
     # via jupyter-client
     # via matplotlib
     # via pandas
@@ -268,6 +277,8 @@ rpds-py==0.27.1
     # via referencing
 ruff==0.13.0
     # via hadamard-diffusion
+s3transfer==0.14.0
+    # via boto3
 scipy==1.16.2
     # via hadamard-diffusion
 seaborn==0.13.2
@@ -340,6 +351,7 @@ tzdata==2025.2
 uri-template==1.3.0
     # via jsonschema
 urllib3==2.5.0
+    # via botocore
     # via requests
     # via sentry-sdk
 wandb==0.22.2

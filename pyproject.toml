@@ -17,6 +17,7 @@ dependencies = [
     "scipy>=1.16.2",
     "sortedcontainers>=2.4.0",
     "wandb>=0.22.2",
+    "boto3>=1.40.55",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"
