@@ -698,7 +698,7 @@ def train_hadamard_diffusion_preshuffled(
     model_kwargs=None,
     device=None,
     save_dir="checkpoints",
-    log_interval=100,
+    log_interval=1,
     eval_interval=5,
     eval_batch_size=8,
     model_type='score',  # 'score' or 'radd'
