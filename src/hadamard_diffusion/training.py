@@ -335,13 +335,7 @@ def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_sam
         'num_unique_values': len(unique_vals)
     }
 
-    # Add optional metrics
-    if include_random_comparison and elbo_random is not None:
-        result.update({
-            'elbo_random': elbo_random,
-            'elbo_difference': elbo_hadamard - elbo_random
-        })
-
+  
     if detailed_analysis:
         result.update({
             'timestep_analysis': timestep_analysis,
@@ -572,7 +566,7 @@ def train_hadamard_diffusion(
                     num_eval_samples=4
                 )
 
-                current_eval_loss = eval_metrics['elbo/mean']
+                current_eval_loss = eval_metrics['elbo_hadamard']
                 print(f"Evaluation - ELBO: {current_eval_loss:.4f}")
 
                 if use_wandb:
