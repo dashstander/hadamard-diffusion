@@ -466,7 +466,7 @@ def train_hadamard_diffusion(
     ema = EMA(model)
 
     # Learning rate scheduler - estimate steps per epoch
-    estimated_steps_per_epoch = len(train_dataset) // batch_size
+    estimated_steps_per_epoch = len(train_dataset)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * estimated_steps_per_epoch)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -485,8 +485,8 @@ def train_hadamard_diffusion(
             'eval_fraction': eval_fraction,
             'train_seed': train_seed,
             'eval_seed': eval_seed,
-            'total_train_matrices': len(train_dataset),
-            'total_eval_matrices': len(eval_dataset)
+            'total_train_matrices': len(train_dataset) * batch_size,
+            'total_eval_matrices': len(eval_dataset) * batch_size
         }
 
         if model_kwargs:
@@ -499,7 +499,7 @@ def train_hadamard_diffusion(
         )
 
         # Log model architecture
-        wandb.watch(model, log_freq=log_interval)
+        wandb.watch(model)
 
     # Training loop
     global_step = 0

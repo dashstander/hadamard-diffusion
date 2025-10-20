@@ -71,7 +71,7 @@ def main():
         matrix_size=args.matrix_size,
         model_kwargs=model_kwargs,
         save_dir=args.save_dir,
-        log_interval=1,
+        log_interval=10,
         eval_step_interval=args.eval_steps,
         eval_batch_size=32,
         model_type='radd',           # Time-independent RADD model
