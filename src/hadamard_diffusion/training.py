@@ -323,24 +323,16 @@ def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_sam
     # Build result dictionary
     result = {
         'elbo_hadamard': elbo_hadamard,
-        'binary_rate': validation_results['binary_rate'],  # Always 100% due to discrete sampling
+        #'binary_rate': validation_results['binary_rate'],  # Always 100% due to discrete sampling
         'orthogonal_rate': validation_results['orthogonal_rate'],
         'valid_hadamard_rate': validation_results['valid_rate'],
         'mean_orthogonal_error': np.mean(orthogonal_errors),
         'std_orthogonal_error': np.std(orthogonal_errors),
         'mean_hadamard_energy': np.mean(hadamard_energies),
         'std_hadamard_energy': np.std(hadamard_energies),
-        'value_range': value_range,
-        'unique_values': unique_vals.cpu().tolist(),
-        'num_unique_values': len(unique_vals)
+      
     }
 
-  
-    if detailed_analysis:
-        result.update({
-            'timestep_analysis': timestep_analysis,
-            'denoising_analysis': denoising_analysis
-        })
 
     return result
 
@@ -527,7 +519,7 @@ def train_hadamard_diffusion(
 
             with torch.amp.autocast('cuda'):
                 loss = loss_fn(model, batch.to(device))
-                
+
             scheduler.step()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -558,7 +550,6 @@ def train_hadamard_diffusion(
 
             # Step-based evaluation
             if global_step % eval_step_interval == 0:
-                print("\nRunning evaluation...")
                 ema.apply_shadow(model)
                 eval_metrics = evaluate_model(
                     model, eval_batch, graph, device,

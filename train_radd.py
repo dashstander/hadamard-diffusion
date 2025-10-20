@@ -71,9 +71,9 @@ def main():
         matrix_size=args.matrix_size,
         model_kwargs=model_kwargs,
         save_dir=args.save_dir,
-        log_interval=50,
+        log_interval=1,
         eval_step_interval=args.eval_steps,
-        eval_batch_size=16,
+        eval_batch_size=32,
         model_type='radd',           # Time-independent RADD model
         loss_type='t_dce',           # t-DCE loss for RADD
         graph_type='absorbing',      # Absorbing diffusion
@@ -81,8 +81,8 @@ def main():
         wandb_project="hadamard-diffusion",
         wandb_run_name=args.run_name,
         eval_fraction=0.1,
-        train_seed=42,
-        eval_seed=43
+        train_seed=0,
+        eval_seed=0
     )
 
     print("\n" + "=" * 60)
