@@ -531,8 +531,8 @@ def train_hadamard_diffusion(
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast('cuda'):
-                loss = loss_fn(model, batch)
+            with torch.amp.autocast(device):
+                loss = loss_fn(model, batch.to(device))
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
