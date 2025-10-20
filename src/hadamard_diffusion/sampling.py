@@ -240,6 +240,206 @@ def validate_hadamard_properties(matrices, tolerance=1e-6):
     return results
 
 
+class RADDSampler:
+    """RADD-style sampler for time-independent models"""
+
+    def __init__(self, graph, mask_value=0):
+        self.graph = graph
+        self.mask_value = mask_value  # Absorbing/mask state value (e.g., 2 for {-1, +1} domain)
+
+    def update_fn(self, model, x, t, step_size):
+        """One RADD update step using strategic mask replacement"""
+        # Get conditional probabilities from time-independent model
+        log_probs = model(x)  # (batch, height, width, num_classes)
+        probs = torch.exp(log_probs)
+
+        # Compute update rate based on time schedule
+        # Similar to RADD's get_update_rate but for binary case
+        curr_sigma = t
+        next_sigma = t - step_size
+
+        # For absorbing diffusion: update_rate = (exp(-next_sigma) - exp(-curr_sigma)) / (1 - exp(-curr_sigma))
+        update_rate = (torch.exp(-next_sigma) - torch.exp(-curr_sigma)) / (1 - torch.exp(-curr_sigma))
+        update_rate = torch.clamp(update_rate, 0.0, 1.0)
+
+        # Find mask positions (positions to potentially update)
+        mask_positions = (x == self.mask_value)
+
+        # Determine which mask positions to update this step
+        update_mask = mask_positions & (torch.rand_like(x.float()) < update_rate.unsqueeze(-1).unsqueeze(-1))
+
+        # Sample new values for positions to update
+        if update_mask.any():
+            # Get probabilities for mask positions only (exclude mask token probability)
+            update_probs = probs[update_mask][..., :-1]  # Remove mask token dimension
+
+            # Sample from {-1, +1} for binary case
+            new_indices = sample_categorical(update_probs)
+            new_values = self.graph.index_to_value(new_indices)
+
+            # Update the tensor
+            x = x.clone()
+            x[update_mask] = new_values
+
+        return x
+
+
+class BinaryAbsorbingSampler:
+    """Sampler that handles absorbing/mask states for RADD-style sampling"""
+
+    def __init__(self, graph, mask_value=0):
+        self.graph = graph
+        self.mask_value = mask_value
+        self.radd_sampler = RADDSampler(graph, mask_value)
+
+    def sample_fn(self, model, batch_size, matrix_size, steps=100, eps=1e-5,
+                  show_progress=True, strategy="direct"):
+        """Generate samples using RADD-style sampling"""
+        device = next(model.parameters()).device
+        model.eval()
+
+        with torch.no_grad():
+            # Start from pure absorbing state (all mask tokens)
+            x = torch.full((batch_size, matrix_size, matrix_size),
+                          self.mask_value, dtype=torch.long, device=device)
+
+            # Create timestep schedule (from 1.0 to eps)
+            timesteps = torch.linspace(1.0, eps, steps + 1, device=device)
+            dt = (1.0 - eps) / steps
+
+            # Reverse diffusion process
+            iterator = range(steps)
+            if show_progress:
+                iterator = tqdm(iterator, desc="RADD Sampling")
+
+            for i in iterator:
+                t = timesteps[i].expand(batch_size, 1)
+
+                if strategy == "direct":
+                    # Direct RADD sampling strategy
+                    x = self._direct_sample_step(model, x, t, dt)
+                else:
+                    # Use the RADD sampler
+                    x = self.radd_sampler.update_fn(model, x, t, dt)
+
+            # Final step: replace any remaining mask tokens
+            x = self._final_cleanup(model, x)
+
+        return x
+
+    def _direct_sample_step(self, model, x, t, dt):
+        """Direct sampling step similar to RADD's direct_sample method"""
+        # Get conditional probabilities
+        log_probs = model(x)
+        probs = torch.exp(log_probs)
+
+        # Compute update rate
+        curr_sigma = t
+        next_sigma = t - dt
+        update_rate = (torch.exp(-next_sigma) - torch.exp(-curr_sigma)) / (1 - torch.exp(-curr_sigma))
+        update_rate = torch.clamp(update_rate, 0.0, 1.0)
+
+        # Find mask positions
+        mask = (x == self.mask_value)
+
+        if mask.any():
+            # Get probabilities for mask positions
+            p_condition_mask = probs[mask].clone()
+
+            # For each mask position, we need to apply the update rate
+            # Since update_rate has batch dimension, we need to handle this carefully
+            num_mask_positions = mask.sum().item()
+
+            # Create update rate tensor for each mask position
+            # We'll use the same update rate for all positions in a batch
+            batch_indices = torch.nonzero(mask, as_tuple=True)[0]  # Get batch indices of mask positions
+            position_update_rates = update_rate.squeeze()[batch_indices]  # Shape: (num_mask_positions,)
+
+            # Scale non-mask probabilities by update rate
+            p_condition_mask[..., :-1] *= position_update_rates.unsqueeze(-1)  # Scale first 2 classes
+
+            # Set probability of staying in mask state
+            p_condition_mask[..., -1] = 1 - position_update_rates
+
+            # Sample new values
+            update_indices = sample_categorical(p_condition_mask.to(torch.float32))
+
+            # Update the tensor with converted values
+            x_new = x.clone()
+            # Convert sampled indices to actual values
+            converted_values = torch.where(
+                update_indices == 0, -1,  # Class 0 -> value -1
+                torch.where(
+                    update_indices == 1, 1,  # Class 1 -> value +1
+                    self.mask_value  # Class 2 (mask) -> mask_value (0)
+                )
+            )
+            x_new[mask] = converted_values
+
+            return x_new
+
+        return x
+
+    def _final_cleanup(self, model, x):
+        """Final cleanup to replace any remaining mask tokens"""
+        x = x.clone()  # Make sure we're working with a copy
+        mask = (x == self.mask_value)
+        if mask.any():
+            log_probs = model(x)
+            # Take argmax excluding mask token dimension (first 2 classes are -1, +1)
+            final_indices = log_probs[..., :-1].argmax(dim=-1)
+            # Convert indices to actual values: 0 -> -1, 1 -> +1
+            final_values = torch.where(final_indices == 0, -1, 1)
+            x[mask] = final_values[mask]
+        return x
+
+
+def get_radd_sampler(
+    model,
+    graph,
+    matrix_size=32,
+    steps=100,
+    eps=1e-5,
+    device=None,
+    show_progress=True,
+    strategy="direct"
+):
+    """
+    Create a RADD-style sampling function for time-independent models
+
+    Args:
+        model: Time-independent model (e.g., HadamardRADDModel)
+        graph: BinaryUniformGraph instance
+        matrix_size: Size of matrices to generate
+        steps: Number of diffusion steps
+        eps: Small epsilon for numerical stability
+        device: Device to run on
+        show_progress: Whether to show progress bar
+        strategy: "direct" for direct sampling strategy
+
+    Returns:
+        Sampling function that takes batch_size and returns generated matrices
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    sampler = BinaryAbsorbingSampler(graph, mask_value=0)  # Use 0 as mask token
+
+    def sample_fn(batch_size):
+        """Generate batch_size Hadamard matrices using RADD sampling"""
+        return sampler.sample_fn(
+            model=model,
+            batch_size=batch_size,
+            matrix_size=matrix_size,
+            steps=steps,
+            eps=eps,
+            show_progress=show_progress,
+            strategy=strategy
+        )
+
+    return sample_fn
+
+
 # Example usage and testing
 if __name__ == "__main__":
     from .score_model import HadamardScoreModel

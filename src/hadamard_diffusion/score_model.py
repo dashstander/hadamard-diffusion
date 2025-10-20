@@ -91,6 +91,22 @@ class HadamardScoreModel(nn.Module):
 
         return log_scores
 
+    def get_sampler(self, graph, matrix_size=32, steps=100, predictor="euler",
+                   denoise=True, eps=1e-5, device=None, show_progress=True):
+        """Get appropriate sampler for this time-dependent model"""
+        from .sampling import get_binary_sampler
+        return get_binary_sampler(
+            model=self,
+            graph=graph,
+            matrix_size=matrix_size,
+            steps=steps,
+            predictor=predictor,
+            denoise=denoise,
+            eps=eps,
+            device=device,
+            show_progress=show_progress
+        )
+
 
 class HadamardRADDModel(nn.Module):
     """RADD (time-independent) version of Hadamard score model"""
@@ -108,9 +124,9 @@ class HadamardRADDModel(nn.Module):
         super().__init__()
         self.matrix_size = matrix_size
         self.element_dim = element_dim
-        self.num_classes = 2  # {-1, +1}
+        self.num_classes = 3  # {-1, +1, mask}
 
-        # Input embedding: map {-1, +1} -> embeddings
+        # Input embedding: map {-1, +1, mask} -> embeddings
         self.embedding = MatrixEmbedding(embed_dim=element_dim, size=matrix_size)
 
         # Stack of time-independent transformer layers
@@ -129,13 +145,14 @@ class HadamardRADDModel(nn.Module):
         self.final_norm = RMSNorm(element_dim)
 
         # Output projection to conditional probabilities
-        # Each element outputs 2 probabilities for {-1, +1} classes
+        # Each element outputs 3 probabilities for {-1, +1, mask} classes
         self.prob_proj = nn.Linear(element_dim, self.num_classes)
 
     def forward(self, x):
         """
         Args:
-            x: (batch, height, width) tensor with values in {-1, +1}
+            x: (batch, height, width) tensor with values in {-1, +1, mask_token}
+               where mask_token is typically 0 or 2
 
         Returns:
             log_probs: (batch, height, width, num_classes) log conditional probabilities
@@ -173,3 +190,18 @@ class HadamardRADDModel(nn.Module):
             probs: (batch, height, width, num_classes) conditional probabilities
         """
         return softmax(self.forward(x), dim=-1)
+
+    def get_sampler(self, graph, matrix_size=32, steps=100, eps=1e-5,
+                   device=None, show_progress=True, strategy="direct"):
+        """Get appropriate sampler for this time-independent RADD model"""
+        from .sampling import get_radd_sampler
+        return get_radd_sampler(
+            model=self,
+            graph=graph,
+            matrix_size=matrix_size,
+            steps=steps,
+            eps=eps,
+            device=device,
+            show_progress=show_progress,
+            strategy=strategy
+        )
