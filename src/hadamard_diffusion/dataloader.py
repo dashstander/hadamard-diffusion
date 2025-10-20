@@ -31,7 +31,7 @@ class PreShuffledHadamardDataset(IterableDataset):
             raise ValueError(f"end_idx {self.end_idx} out of bounds ({self.start_idx}, {self.matrices.shape[0]}]")
 
     def __len__(self):
-        return self.end_idx - self.start_idx
+        return (self.end_idx - self.start_idx) // self.batch_size
     
     def transformations(self, batch_size):
         indices = np.tile(np.arange(self.order), (batch_size, 1))
