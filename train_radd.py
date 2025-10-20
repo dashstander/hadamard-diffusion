@@ -13,7 +13,7 @@ import sys
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from hadamard_diffusion.training import train_hadamard_diffusion_preshuffled
+from hadamard_diffusion.training import train_hadamard_diffusion
 
 
 def main():
@@ -63,7 +63,7 @@ def main():
     print("=" * 60)
 
     # Train the model
-    model, final_metrics = train_hadamard_diffusion_preshuffled(
+    model, final_metrics = train_hadamard_diffusion(
         file_path=args.data_path,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
