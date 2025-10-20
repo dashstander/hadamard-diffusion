@@ -580,7 +580,7 @@ def train_hadamard_diffusion(
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
-                        'ema_state_dict': ema.state_dict(),
+                        'ema_state_dict': ema.shadow,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': best_eval_loss,
@@ -596,7 +596,7 @@ def train_hadamard_diffusion(
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
-            'ema_state_dict': ema.state_dict(),
+            'ema_state_dict': ema.shadow,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': epoch_loss / max(num_batches, 1),
