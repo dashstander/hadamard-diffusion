@@ -291,7 +291,7 @@ def evaluate_model(model, eval_data, graph, device, matrix_size=32, num_eval_sam
 
     # Generate samples
     with torch.no_grad():
-        generated_samples = sampler(num_eval_samples)
+        generated_samples = sampler(num_eval_samples).to(torch.float16)
 
     # Validate Hadamard properties
     validation_results = validate_hadamard_properties(generated_samples, tolerance=1.0)
