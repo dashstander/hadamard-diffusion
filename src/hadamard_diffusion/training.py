@@ -527,11 +527,11 @@ def train_hadamard_diffusion(
 
             with torch.amp.autocast('cuda'):
                 loss = loss_fn(model, batch.to(device))
-
+                
+            scheduler.step()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
 
             # Update EMA
             ema.update(model)
